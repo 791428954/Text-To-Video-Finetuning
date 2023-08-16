@@ -1,0 +1,13 @@
+accelerate==0.19
+torch
+torchvision
+torchaudio
+transformers
+einops
+decord
+tqdm
+safetensors
+omegaconf
+opencv-python
+pydantic
+compel

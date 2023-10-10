@@ -1,4 +1,9 @@
 output/
+outputs/
+dataset/
+datasets_test/
+loggerfolder*/
+TATS/
 models/lama.ckpt
 .vscode/
 models/model_scope_diffusers/

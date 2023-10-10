@@ -7,6 +7,7 @@ import os
 import random
 import gc
 import copy
+from accelerate.utils import LoggerType
 
 from typing import Dict, Optional, Tuple
 from omegaconf import OmegaConf
@@ -21,6 +22,8 @@ import transformers
 
 from torchvision import transforms
 from tqdm.auto import tqdm
+
+from accelerate.utils import ProjectConfiguration
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -38,7 +41,7 @@ from diffusers.models.attention import BasicTransformerBlock
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.models.clip.modeling_clip import CLIPEncoder
 from utils.dataset import VideoJsonDataset, SingleVideoDataset, \
-    ImageDataset, VideoFolderDataset, CachedDataset
+    ImageDataset, VideoFolderDataset, CachedDataset,VideoFolderDataset2,VideoFolderDatasetUCF
 from einops import rearrange, repeat
 from utils.lora_handler import LoraHandler, LORA_VERSIONS
 
@@ -66,7 +69,7 @@ def get_train_dataset(dataset_types, train_data, tokenizer):
     train_datasets = []
 
     # Loop through all available datasets, get the name, then add to list of data to process.
-    for DataSet in [VideoJsonDataset, SingleVideoDataset, ImageDataset, VideoFolderDataset]:
+    for DataSet in [VideoJsonDataset, SingleVideoDataset, ImageDataset, VideoFolderDataset,VideoFolderDataset2,VideoFolderDatasetUCF]:
         for dataset in dataset_types:
             if dataset == DataSet.__getname__():
                 train_datasets.append(DataSet(**train_data, tokenizer=tokenizer))
@@ -74,7 +77,7 @@ def get_train_dataset(dataset_types, train_data, tokenizer):
     if len(train_datasets) > 0:
         return train_datasets
     else:
-        raise ValueError("Dataset type not found: 'json', 'single_video', 'folder', 'image'")
+        raise ValueError("Dataset type not found: 'json', 'single_video', 'folder', 'image','text_folder','UCF_folder'")
 
 def extend_datasets(datasets, dataset_items, extend=False):
     biggest_data_len = max(x.__len__() for x in datasets)
@@ -108,7 +111,7 @@ def export_to_video(video_frames, output_video_path, fps):
 def create_output_folders(output_dir, config):
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     out_dir = os.path.join(output_dir, f"train_{now}")
-    
+
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(f"{out_dir}/samples", exist_ok=True)
     OmegaConf.save(config, os.path.join(out_dir, 'config.yaml'))
@@ -130,17 +133,17 @@ def unet_and_text_g_c(unet, text_encoder, unet_enable, text_enable):
 
 def freeze_models(models_to_freeze):
     for model in models_to_freeze:
-        if model is not None: model.requires_grad_(False) 
-            
+        if model is not None: model.requires_grad_(False)
+
 def is_attn(name):
    return ('attn1' or 'attn2' == name.split('.')[-1])
 
 def set_processors(attentions):
-    for attn in attentions: attn.set_processor(AttnProcessor2_0()) 
+    for attn in attentions: attn.set_processor(AttnProcessor2_0())
 
 def set_torch_2_attn(unet):
     optim_count = 0
-    
+
     for name, module in unet.named_modules():
         if is_attn(name):
             if isinstance(module, torch.nn.ModuleList):
@@ -148,48 +151,48 @@ def set_torch_2_attn(unet):
                     if isinstance(m, BasicTransformerBlock):
                         set_processors([m.attn1, m.attn2])
                         optim_count += 1
-    if optim_count > 0: 
+    if optim_count > 0:
         print(f"{optim_count} Attention layers using Scaled Dot Product Attention.")
 
-def handle_memory_attention(enable_xformers_memory_efficient_attention, enable_torch_2_attn, unet): 
+def handle_memory_attention(enable_xformers_memory_efficient_attention, enable_torch_2_attn, unet):
     try:
         is_torch_2 = hasattr(F, 'scaled_dot_product_attention')
         enable_torch_2 = is_torch_2 and enable_torch_2_attn
-        
+
         if enable_xformers_memory_efficient_attention and not enable_torch_2:
             if is_xformers_available():
                 from xformers.ops import MemoryEfficientAttentionFlashAttentionOp
                 unet.enable_xformers_memory_efficient_attention(attention_op=MemoryEfficientAttentionFlashAttentionOp)
             else:
                 raise ValueError("xformers is not available. Make sure it is installed correctly")
-        
+
         if enable_torch_2:
             set_torch_2_attn(unet)
-            
+
     except:
         print("Could not enable memory efficient attention for xformers or Torch 2.0.")
 
 def param_optim(model, condition, extra_params=None, is_lora=False, negation=None):
     extra_params = extra_params if len(extra_params.keys()) > 0 else None
     return {
-        "model": model, 
-        "condition": condition, 
+        "model": model,
+        "condition": condition,
         'extra_params': extra_params,
         'is_lora': is_lora,
         "negation": negation
     }
-    
+
 
 def create_optim_params(name='param', params=None, lr=5e-6, extra_params=None):
     params = {
-        "name": name, 
-        "params": params, 
+        "name": name,
+        "params": params,
         "lr": lr
     }
     if extra_params is not None:
         for k, v in extra_params.items():
             params[k] = v
-    
+
     return params
 
 def negate_params(name, negation):
@@ -209,14 +212,14 @@ def create_optimizer_params(model_list, lr):
     for optim in model_list:
         model, condition, extra_params, is_lora, negation = optim.values()
         # Check if we are doing LoRA training.
-        if is_lora and condition and isinstance(model, list): 
+        if is_lora and condition and isinstance(model, list):
             params = create_optim_params(
-                params=itertools.chain(*model), 
+                params=itertools.chain(*model),
                 extra_params=extra_params
             )
             optimizer_params.append(params)
             continue
-            
+
         if is_lora and  condition and not isinstance(model, list):
             for n, p in model.named_parameters():
                 if 'lora' in n:
@@ -232,7 +235,7 @@ def create_optimizer_params(model_list, lr):
 
                 params = create_optim_params(n, p, lr, extra_params)
                 optimizer_params.append(params)
-    
+
     return optimizer_params
 
 def get_optimizer(use_8bit_adam):
@@ -264,23 +267,23 @@ def cast_to_gpu_and_type(model_list, accelerator, weight_dtype):
         if model is not None: model.to(accelerator.device, dtype=weight_dtype)
 
 def handle_cache_latents(
-        should_cache, 
-        output_dir, 
-        train_dataloader, 
-        train_batch_size, 
-        vae, 
+        should_cache,
+        output_dir,
+        train_dataloader,
+        train_batch_size,
+        vae,
         cached_latent_dir=None,
         shuffle=False
     ):
 
-    # Cache latents by storing them in VRAM. 
+    # Cache latents by storing them in VRAM.
     # Speeds up training and saves memory by not encoding during the train loop.
     if not should_cache: return None
     vae.to('cuda', dtype=torch.float16)
     vae.enable_slicing()
-    
+
     cached_latent_dir = (
-        os.path.abspath(cached_latent_dir) if cached_latent_dir is not None else None 
+        os.path.abspath(cached_latent_dir) if cached_latent_dir is not None else None
         )
 
     if cached_latent_dir is None:
@@ -295,7 +298,7 @@ def handle_cache_latents(
             pixel_values = batch['pixel_values'].to('cuda', dtype=torch.float16)
             batch['pixel_values'] = tensor_to_vae_latent(pixel_values, vae)
             for k, v in batch.items(): batch[k] = v[0]
-        
+
             torch.save(batch, full_out_path)
             del pixel_values
             del batch
@@ -304,14 +307,14 @@ def handle_cache_latents(
             torch.cuda.empty_cache()
     else:
         cache_save_dir = cached_latent_dir
-        
+
 
     return torch.utils.data.DataLoader(
-        CachedDataset(cache_dir=cache_save_dir), 
-        batch_size=train_batch_size, 
+        CachedDataset(cache_dir=cache_save_dir),
+        batch_size=train_batch_size,
         shuffle=shuffle,
-        num_workers=0
-    ) 
+        # num_workers=40
+    )
 
 def handle_trainable_modules(model, trainable_modules=None, is_enabled=True, negation=None):
     global already_printed_trainables
@@ -325,14 +328,14 @@ def handle_trainable_modules(model, trainable_modules=None, is_enabled=True, neg
                     model.requires_grad_(is_enabled)
                     unfrozen_params =len(list(model.parameters()))
                     break
-                    
+
                 if tm in name and 'lora' not in name:
                     for m in module.parameters():
                         m.requires_grad_(is_enabled)
                         if is_enabled: unfrozen_params +=1
 
     if unfrozen_params > 0 and not already_printed_trainables:
-        already_printed_trainables = True 
+        already_printed_trainables = True
         print(f"{unfrozen_params} params have been unfrozen for training.")
 
 def tensor_to_vae_latent(t, vae):
@@ -392,12 +395,12 @@ def should_sample(global_step, validation_steps, validation_data):
     and validation_data.sample_preview
 
 def save_pipe(
-        path, 
+        path,
         global_step,
-        accelerator, 
-        unet, 
-        text_encoder, 
-        vae, 
+        accelerator,
+        unet,
+        text_encoder,
+        vae,
         output_dir,
         lora_manager: LoraHandler,
         unet_target_replace_module=None,
@@ -413,7 +416,7 @@ def save_pipe(
         save_path = output_dir
 
     # Save the dtypes so we can continue training at the same precision.
-    u_dtype, t_dtype, v_dtype = unet.dtype, text_encoder.dtype, vae.dtype 
+    u_dtype, t_dtype, v_dtype = unet.dtype, text_encoder.dtype, vae.dtype
 
    # Copy the model without creating a reference to it. This allows keeping the state of our lora training if enabled.
     unet_save = copy.deepcopy(unet.cpu())
@@ -428,7 +431,7 @@ def save_pipe(
         text_encoder=text_encoder_out,
         vae=vae,
     ).to(torch_dtype=torch.float32)
-    
+
     lora_manager.save_lora_weights(model=pipeline, save_path=save_path, step=global_step)
 
     if save_pretrained_model:
@@ -440,7 +443,7 @@ def save_pipe(
         [x[0].to(accelerator.device, dtype=x[1]) for x in models_to_cast_back]
 
     logger.info(f"Saved model at {save_path} on step {global_step}")
-    
+
     del pipeline
     del unet_out
     del text_encoder_out
@@ -451,7 +454,7 @@ def save_pipe(
 def replace_prompt(prompt, token, wlist):
     for w in wlist:
         if w in prompt: return prompt.replace(w, token)
-    return prompt 
+    return prompt
 
 def main(
     pretrained_model_path: str,
@@ -513,13 +516,19 @@ def main(
 ):
 
     *_, config = inspect.getargvalues(inspect.currentframe())
-
+    config1 = ProjectConfiguration(project_dir=".", logging_dir="loggerfolder3")
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=mixed_precision,
-        log_with=logger_type,
-        project_dir=output_dir
+        log_with=LoggerType.TENSORBOARD,
+        project_config=config1
     )
+    config2 = {
+        "num_iterations": 10000,
+        "learning_rate": 1e-5,
+    }
+    accelerator.init_trackers("example_project", config=config2)
+    # tensorboard_tracker = accelerator.get_tracker("tensorboard")
 
     # Make one log on every process with the configuration for debugging.
     create_logging(logging, logger, accelerator)
@@ -540,7 +549,7 @@ def main(
 
     # Freeze any necessary models
     freeze_models([vae, text_encoder, unet])
-    
+
     # Enable xformers if available
     handle_memory_attention(enable_xformers_memory_efficient_attention, enable_torch_2_attn, unet)
 
@@ -552,9 +561,9 @@ def main(
     # Initialize the optimizer
     optimizer_cls = get_optimizer(use_8bit_adam)
 
-    # Use LoRA if enabled.  
+    # Use LoRA if enabled.
     lora_manager = LoraHandler(
-        version=lora_version, 
+        version=lora_version,
         use_unet_lora=use_unet_lora,
         use_text_lora=use_text_lora,
         save_for_webui=save_lora_for_webui,
@@ -565,10 +574,10 @@ def main(
     )
 
     unet_lora_params, unet_negation = lora_manager.add_lora_to_model(
-        use_unet_lora, unet, lora_manager.unet_replace_modules, lora_unet_dropout, lora_path, r=lora_rank) 
+        use_unet_lora, unet, lora_manager.unet_replace_modules, lora_unet_dropout, lora_path, r=lora_rank)
 
     text_encoder_lora_params, text_encoder_negation = lora_manager.add_lora_to_model(
-        use_text_lora, text_encoder, lora_manager.text_encoder_replace_modules, lora_text_dropout, lora_path, r=lora_rank) 
+        use_text_lora, text_encoder, lora_manager.text_encoder_replace_modules, lora_text_dropout, lora_path, r=lora_rank)
 
     # Create parameters to optimize over with a condition (if "condition" is true, optimize it)
     extra_unet_params = extra_unet_params if extra_unet_params is not None else {}
@@ -576,23 +585,23 @@ def main(
 
     trainable_modules_available = trainable_modules is not None
     trainable_text_modules_available = (train_text_encoder and trainable_text_modules is not None)
-    
+
     optim_params = [
         param_optim(unet, trainable_modules_available, extra_params=extra_unet_params, negation=unet_negation),
-        param_optim(text_encoder, trainable_text_modules_available, 
-                        extra_params=extra_text_encoder_params, 
+        param_optim(text_encoder, trainable_text_modules_available,
+                        extra_params=extra_text_encoder_params,
                         negation=text_encoder_negation
                    ),
-        param_optim(text_encoder_lora_params, use_text_lora, is_lora=True, 
+        param_optim(text_encoder_lora_params, use_text_lora, is_lora=True,
                         extra_params={**{"lr": learning_rate}, **extra_unet_params}
                     ),
-        param_optim(unet_lora_params, use_unet_lora, is_lora=True, 
+        param_optim(unet_lora_params, use_unet_lora, is_lora=True,
                         extra_params={**{"lr": learning_rate}, **extra_text_encoder_params}
                     )
     ]
 
     params = create_optimizer_params(optim_params, learning_rate)
-    
+
     # Create Optimizer
     optimizer = optimizer_cls(
         params,
@@ -614,7 +623,7 @@ def main(
     train_datasets = get_train_dataset(dataset_types, train_data, tokenizer)
 
     # If you have extra train data, you can add a list of however many you would like.
-    # Eg: extra_train_data: [{: {dataset_types, train_data: {etc...}}}] 
+    # Eg: extra_train_data: [{: {dataset_types, train_data: {etc...}}}]
     try:
         if extra_train_data is not None and len(extra_train_data) > 0:
             for dataset in extra_train_data:
@@ -631,48 +640,49 @@ def main(
     # Process one dataset
     if len(train_datasets) == 1:
         train_dataset = train_datasets[0]
-    
+
     # Process many datasets
     else:
-        train_dataset = torch.utils.data.ConcatDataset(train_datasets) 
+        train_dataset = torch.utils.data.ConcatDataset(train_datasets)
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, 
+        train_dataset,
         batch_size=train_batch_size,
-        shuffle=shuffle
+        shuffle=shuffle,
+        # num_workers=40
     )
 
      # Latents caching
     cached_data_loader = handle_cache_latents(
-        cache_latents, 
+        cache_latents,
         output_dir,
-        train_dataloader, 
-        train_batch_size, 
+        train_dataloader,
+        train_batch_size,
         vae,
         cached_latent_dir
-    ) 
+    )
 
-    if cached_data_loader is not None: 
+    if cached_data_loader is not None:
         train_dataloader = cached_data_loader
 
     # Prepare everything with our `accelerator`.
     unet, optimizer,train_dataloader, lr_scheduler, text_encoder = accelerator.prepare(
-        unet, 
-        optimizer, 
-        train_dataloader, 
-        lr_scheduler, 
+        unet,
+        optimizer,
+        train_dataloader,
+        lr_scheduler,
         text_encoder
     )
 
     # Use Gradient Checkpointing if enabled.
     unet_and_text_g_c(
-        unet, 
-        text_encoder, 
-        gradient_checkpointing, 
+        unet,
+        text_encoder,
+        gradient_checkpointing,
         text_encoder_gradient_checkpointing
     )
-    
+
     # Enable VAE slicing to save memory.
     vae.enable_slicing()
 
@@ -719,17 +729,17 @@ def main(
     def finetune_unet(batch, train_encoder=False):
         nonlocal use_offset_noise
         nonlocal rescale_schedule
-        
+
         # Check if we are training the text encoder
         text_trainable = (train_text_encoder or lora_manager.use_text_lora)
-        
+
         # Unfreeze UNET Layers
-        if global_step == 0: 
+        if global_step == 0:
             already_printed_trainables = False
             unet.train()
             handle_trainable_modules(
-                unet, 
-                trainable_modules, 
+                unet,
+                trainable_modules,
                 is_enabled=True,
                 negation=unet_negation
             )
@@ -757,28 +767,28 @@ def main(
         # Add noise to the latents according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-    
+
         # Enable text encoder training
         if text_trainable:
             text_encoder.train()
 
-            if lora_manager.use_text_lora: 
+            if lora_manager.use_text_lora:
                 text_encoder.text_model.embeddings.requires_grad_(True)
 
             if global_step == 0 and train_text_encoder:
                 handle_trainable_modules(
-                    text_encoder, 
+                    text_encoder,
                     trainable_modules=trainable_text_modules,
                     negation=text_encoder_negation
             )
             cast_to_gpu_and_type([text_encoder], accelerator, torch.float32)
-               
+
         # *Potentially* Fixes gradient checkpointing training.
         # See: https://github.com/prigoyal/pytorch_memonger/blob/master/tutorial/Checkpointing_for_PyTorch_models.ipynb
         if kwargs.get('eval_train', False):
             unet.eval()
             text_encoder.eval()
-            
+
         # Encode text embeddings
         token_ids = batch['prompt_ids']
         encoder_hidden_states = text_encoder(token_ids)[0]
@@ -793,7 +803,7 @@ def main(
         else:
             raise ValueError(f"Unknown prediction type {noise_scheduler.prediction_type}")
 
-        
+
         # Here we do two passes for video and text training.
         # If we are on the second iteration of the loop, get one frame.
         # This allows us to train text information only on the spatial layers.
@@ -812,7 +822,7 @@ def main(
             if should_truncate_video and i == 1:
                 noisy_latents = noisy_latents[:,:,1,:,:].unsqueeze(2)
                 target = target[:,:,1,:,:].unsqueeze(2)
-                       
+
             encoder_hidden_states = (
                 detached_encoder_state if should_detach else trainable_encoder_state
             )
@@ -821,31 +831,32 @@ def main(
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             losses.append(loss)
-            
+
             # This was most likely single frame training or a single image.
             if video_length == 1 and i == 0: break
 
-        loss = losses[0] if len(losses) == 1 else losses[0] + losses[1] 
-
+        loss = losses[0] if len(losses) == 1 else losses[0] + losses[1]
+        # tensorboard_tracker.log({"training_loss": loss}, step=iter)
+        accelerator.log({"training_loss": loss}, step=iter)
         return loss, latents
 
     for epoch in range(first_epoch, num_train_epochs):
         train_loss = 0.0
-        
+
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
-            
+
             with accelerator.accumulate(unet) ,accelerator.accumulate(text_encoder):
 
                 text_prompt = batch['text_prompt'][0]
-                
+
                 with accelerator.autocast():
                     loss, latents = finetune_unet(batch, train_encoder=train_text_encoder)
-                
+
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(train_batch_size)).mean()
                 train_loss += avg_loss.item() / gradient_accumulation_steps
@@ -860,13 +871,13 @@ def main(
                         params_to_clip = unet.parameters()
 
                     accelerator.clip_grad_norm_(params_to_clip, max_grad_norm)
-                
+
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                    
+
                 except Exception as e:
-                    print(f"An error has occured during backpropogation! {e}") 
+                    print(f"An error has occured during backpropogation! {e}")
                     continue
 
             # Checks if the accelerator has performed an optimization step behind the scenes
@@ -875,16 +886,16 @@ def main(
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
-            
+
                 if global_step % checkpointing_steps == 0:
                     save_pipe(
-                        pretrained_model_path, 
-                        global_step, 
-                        accelerator, 
-                        unet, 
-                        text_encoder, 
-                        vae, 
-                        output_dir, 
+                        pretrained_model_path,
+                        global_step,
+                        accelerator,
+                        unet,
+                        text_encoder,
+                        vae,
+                        output_dir,
                         lora_manager,
                         unet_lora_modules,
                         text_encoder_lora_modules,
@@ -895,12 +906,12 @@ def main(
                 if should_sample(global_step, validation_steps, validation_data):
                     if global_step == 1: print("Performing validation prompt.")
                     if accelerator.is_main_process:
-                        
+
                         with accelerator.autocast():
                             unet.eval()
                             text_encoder.eval()
                             unet_and_text_g_c(unet, text_encoder, False, False)
-                            lora_manager.deactivate_lora_train([unet, text_encoder], True)    
+                            lora_manager.deactivate_lora_train([unet, text_encoder], True)
 
                             pipeline = TextToVideoSDPipeline.from_pretrained(
                                 pretrained_model_path,
@@ -918,7 +929,7 @@ def main(
                             save_filename = f"{global_step}_dataset-{curr_dataset_name}_{prompt}"
 
                             out_file = f"{output_dir}/samples/{save_filename}.mp4"
-                            
+
                             with torch.no_grad():
                                 video_frames = pipeline(
                                     prompt,
@@ -936,13 +947,13 @@ def main(
                     logger.info(f"Saved a new sample to {out_file}")
 
                     unet_and_text_g_c(
-                        unet, 
-                        text_encoder, 
-                        gradient_checkpointing, 
+                        unet,
+                        text_encoder,
+                        gradient_checkpointing,
                         text_encoder_gradient_checkpointing
                     )
 
-                    lora_manager.deactivate_lora_train([unet, text_encoder], False)    
+                    lora_manager.deactivate_lora_train([unet, text_encoder], False)
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             accelerator.log({"training_loss": loss.detach().item()}, step=step)
@@ -955,19 +966,19 @@ def main(
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         save_pipe(
-                pretrained_model_path, 
-                global_step, 
-                accelerator, 
-                unet, 
-                text_encoder, 
-                vae, 
-                output_dir, 
+                pretrained_model_path,
+                global_step,
+                accelerator,
+                unet,
+                text_encoder,
+                vae,
+                output_dir,
                 lora_manager,
                 unet_lora_modules,
                 text_encoder_lora_modules,
                 is_checkpoint=False,
                 save_pretrained_model=save_pretrained_model
-        )     
+        )
     accelerator.end_training()
 
 if __name__ == "__main__":

@@ -666,6 +666,14 @@ def main(
     if cached_data_loader is not None:
         train_dataloader = cached_data_loader
 
+    # Use Gradient Checkpointing if enabled.
+    unet_and_text_g_c(
+        unet,
+        text_encoder,
+        gradient_checkpointing,
+        text_encoder_gradient_checkpointing
+    )
+
     # Prepare everything with our `accelerator`.
     unet, optimizer,train_dataloader, lr_scheduler, text_encoder = accelerator.prepare(
         unet,
@@ -675,13 +683,6 @@ def main(
         text_encoder
     )
 
-    # Use Gradient Checkpointing if enabled.
-    unet_and_text_g_c(
-        unet,
-        text_encoder,
-        gradient_checkpointing,
-        text_encoder_gradient_checkpointing
-    )
 
     # Enable VAE slicing to save memory.
     vae.enable_slicing()
@@ -729,6 +730,7 @@ def main(
     def finetune_unet(batch, train_encoder=False):
         nonlocal use_offset_noise
         nonlocal rescale_schedule
+        nonlocal text_encoder
 
         # Check if we are training the text encoder
         text_trainable = (train_text_encoder or lora_manager.use_text_lora)
@@ -773,7 +775,10 @@ def main(
             text_encoder.train()
 
             if lora_manager.use_text_lora:
+                text_encoder = accelerator.unwrap_model(text_encoder)
                 text_encoder.text_model.embeddings.requires_grad_(True)
+                # text_encoder=accelerator.prepare(text_encoder)
+                # text_encoder.text_model.embeddings.requires_grad_(True)
 
             if global_step == 0 and train_text_encoder:
                 handle_trainable_modules(
@@ -910,7 +915,10 @@ def main(
                         with accelerator.autocast():
                             unet.eval()
                             text_encoder.eval()
+                            unet = accelerator.unwrap_model(unet)
+                            text_encoder = accelerator.unwrap_model(text_encoder)
                             unet_and_text_g_c(unet, text_encoder, False, False)
+                            
                             lora_manager.deactivate_lora_train([unet, text_encoder], True)
 
                             pipeline = TextToVideoSDPipeline.from_pretrained(
@@ -927,7 +935,6 @@ def main(
 
                             curr_dataset_name = batch['dataset']
                             save_filename = f"{global_step}_dataset-{curr_dataset_name}_{prompt}"
-
                             out_file = f"{output_dir}/samples/{save_filename}.mp4"
 
                             with torch.no_grad():
@@ -944,15 +951,16 @@ def main(
                             del pipeline
                             torch.cuda.empty_cache()
 
-                    logger.info(f"Saved a new sample to {out_file}")
-
+                    # logger.info(f"Saved a new sample to {out_file}")
+                    unet = accelerator.unwrap_model(unet)
+                    text_encoder = accelerator.unwrap_model(text_encoder)
                     unet_and_text_g_c(
                         unet,
                         text_encoder,
                         gradient_checkpointing,
                         text_encoder_gradient_checkpointing
                     )
-
+                    # unet, text_encoder = accelerator.prepare(unet, text_encoder)
                     lora_manager.deactivate_lora_train([unet, text_encoder], False)
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
